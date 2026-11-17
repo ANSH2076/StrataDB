@@ -102,3 +102,8 @@ class MemTable:
         enough for deciding when to flush the memtable in Stage 2.
         """
         return self._size_bytes
+
+    def __len__(self) -> int:
+        """Return the number of keys stored, including tombstones."""
+        return len(self._data)
+
