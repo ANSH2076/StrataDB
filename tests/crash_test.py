@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from strata import Strata
 
-ROUNDS = 5
+ROUNDS = 10
 MIN_ACKS = 500
 MAX_ACKS = 2000
 
@@ -62,6 +62,9 @@ def run_one_round(round_num: int, base_dir: str) -> bool:
     proc.kill()
     proc.wait()
 
+    # Count how many .sst files existed when the process was killed.
+    sst_count = len([f for f in os.listdir(data_dir) if f.endswith(".sst")])
+
     # Reopen and verify.
     start = time.time()
     with Strata(data_dir) as db:
@@ -82,6 +85,7 @@ def run_one_round(round_num: int, base_dir: str) -> bool:
     status = "PASS" if passed else "FAIL"
     print(f"  Round {round_num}: {status} — "
           f"{len(acked_indices)} acked writes, "
+          f"{sst_count} .sst files on disk, "
           f"recovery took {recovery_ms:.1f} ms")
 
     if missing:

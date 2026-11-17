@@ -27,7 +27,8 @@ def main() -> None:
     data_dir = sys.argv[1]
 
     # sync=True ensures every put is fsync'd before we print the index.
-    db = Strata(data_dir, sync=True)
+    # memtable_limit_bytes=2048 triggers frequent flushes to SSTables.
+    db = Strata(data_dir, sync=True, memtable_limit_bytes=2048)
 
     i = 0
     while True:
