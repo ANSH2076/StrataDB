@@ -6,7 +6,7 @@ Strata never loses a write it has acknowledged. You can kill the process at a ra
 
 > 📽️ **Demo GIF goes here** (kill the writer mid-flush, restart, show all keys recovered)
 
-![python](https://img.shields.io/badge/python-3.9%2B-blue) ![deps](https://img.shields.io/badge/dependencies-none-green) ![tests](https://img.shields.io/badge/tests-34%20passing-brightgreen)
+![python](https://img.shields.io/badge/python-3.9%2B-blue) ![deps](https://img.shields.io/badge/dependencies-none-green) ![tests](https://img.shields.io/badge/tests-59%20passing-brightgreen)
 
 ---
 
@@ -24,7 +24,24 @@ A library analogy explains the whole design:
 | A small, sorted pile of new books on the desk | **MemTable**: a sorted-on-demand in-memory table, for fast reads and writes |
 | When the desk pile is full, it is boxed up as a sorted, never-edited box | **SSTable**: an immutable sorted file on disk |
 | A label on each box that can say "definitely not in here" | **Bloom filter**: skips files that can't contain the key |
-| Merging many small boxes into fewer big ones | **Compaction** (roadmap) |
+| Merging many small boxes into fewer big ones | **Compaction**: merges SSTables, dropping overwritten values and tombstones |
+
+## Live Dashboard
+
+Watch keys move through the LSM-tree in real time with the zero-dependency "glass box" dashboard:
+
+```bash
+python3 -m strata.server --data ./mydata --port 8000
+```
+Then open `http://localhost:8000` in your browser.
+
+![Strata Live Dashboard](docs/dashboard.png)
+
+Features:
+- **Write Path Meters:** Real-time visual capacity of the in-memory MemTable and on-disk WAL size.
+- **SSTables Stack:** Active levels, size, key ranges, and bloom filter metadata for each on-disk table.
+- **Interactive Lookup Tracer:** Step-by-step visual lookup across MemTable, bloom filters, and sparse indexes with animated badge statuses.
+- **Live Controls & Simulated Crash:** Insert keys, batch load demo data, trigger compaction, toggle bloom filters, and trigger simulated crashes with instant post-recovery data integrity audits.
 
 ## How it works
 
@@ -83,7 +100,7 @@ Every record in the WAL and in SSTables is stored as:
 
 ### Tests
 
-- **34 unit tests passing**, covering recovery, torn writes, corrupt checksums, tombstones across levels, sparse-index boundaries, the crash window, leftover temp files, and Unicode/quote/newline round-trips.
+- **59 unit tests passing**, covering recovery, torn writes, corrupt checksums, tombstones across levels, sparse-index boundaries, crash windows, atomic manifest commit, compaction, REST API endpoints, and Unicode/quote/newline round-trips.
 - **10 random-kill crash rounds passing**: a writer process is killed after a random number of acknowledged writes (500-2000) while the memtable is flushing often. Every acknowledged key must be present and correct after restart.
 
 ### Bloom filter benchmark
@@ -118,9 +135,10 @@ with Strata("./mydata") as db:
 Options: `Strata(data_dir, sync=True, memtable_limit_bytes=4*1024*1024, use_bloom=True)`.
 
 ```bash
-python3 -m pytest -v            # 34 unit tests
+python3 -m pytest -v            # 59 unit tests
 python3 tests/crash_test.py     # kill-the-process durability test
 python3 tests/bench_reads.py    # bloom filter benchmark
+python3 -m strata.server        # run HTTP server & dashboard
 ```
 
 ## Project layout
@@ -132,7 +150,13 @@ strata/
   memtable.py    in-memory table with tombstones
   sstable.py     immutable sorted files, atomic writer, sparse index, bloom filter
   bloom.py       bloom filter (blake2b double hashing)
-  engine.py      public API, flush, recovery, multi-level reads
+  manifest.py    atomic MANIFEST management and commit
+  compaction.py  multi-way merge compaction and tombstone eviction
+  events.py      thread-safe circular event log
+  engine.py      public API, flush, recovery, multi-level reads, trace_get
+  server.py      standard-library HTTP server & REST API
+dashboard/
+  index.html     single-file dark glass-box dashboard (vanilla JS & CSS)
 tests/           unit tests, crash test, benchmark
 docs/            learning notes for each stage
 ```
@@ -143,17 +167,18 @@ docs/            learning notes for each stage
 - **The bloom filter uses `hashlib`, not Python's `hash()`.** Python randomizes string hashes per process, so a filter would give different answers after a restart. A test proves the filter is identical under different `PYTHONHASHSEED` values.
 - **Tombstone keys are added to the bloom filter too.** If they weren't, the search would skip the newer file holding the tombstone, and a deleted value from an older file would come back.
 - **Sparse index.** Every 16th key and its byte offset is kept in memory. A lookup binary-searches that small list, jumps to the block, and reads at most 16 records instead of scanning the file.
+- **Atomic MANIFEST file.** Compaction writes `MANIFEST.tmp` and renames it atomically to `MANIFEST`, guaranteeing the active SSTable set is never partially updated even during a crash.
+- **Single-lock server concurrency.** A single global `threading.Lock` protects engine calls in the HTTP server, keeping the core database simple, thread-safe, and free of complex lock hierarchies.
 
 ## Known limitations
 
-- No compaction yet, so SSTables pile up and tombstones are never removed.
 - SSTable files are opened on every lookup, and the sparse index and bloom filter are rebuilt by scanning each file at startup. Both are simple tradeoffs for now.
-- Single process, single thread. No transactions, no replication.
+- Single process concurrency model. No multi-node clustering or distributed consensus.
 
 ## Roadmap
 
-- [ ] **Compaction:** merge SSTables in the background, dropping overwritten values and tombstones
-- [ ] **Live "glass box" dashboard:** watch keys move from the MemTable into SSTables, bloom filters rejecting lookups, and compaction merging files in real time
+- [x] **Compaction:** merge SSTables in the background, dropping overwritten values and tombstones
+- [x] **Live "glass box" dashboard:** watch keys move from the MemTable into SSTables, bloom filters rejecting lookups, and compaction merging files in real time
 - [ ] Persist bloom filters so startup doesn't rescan every file
 
 ## What I learned
@@ -174,9 +199,6 @@ about order: the write-ahead log is only cleared *after* the new SSTable is
 fully written, `fsync`ed and atomically renamed, so at any moment either the
 log or the SSTable has the data. I built this with AI assistance, and I reviewed, tested and can explain
 each component.
-
-Next I want to add compaction and the live dashboard so you
-can watch the engine work.
 
 ## Learning notes
 
