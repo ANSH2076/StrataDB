@@ -96,9 +96,32 @@ class WriteAheadLog:
 
         # Truncate any trailing garbage so the next append is clean.
         with open(self._path, "r+b") as f:
+            f.seek(0, os.SEEK_END)
+            total_size = f.tell()
+            self._damaged_bytes_truncated = max(0, total_size - last_good_offset)
             f.truncate(last_good_offset)
 
+        self._record_count = len(good_records)
         return good_records
+
+    @property
+    def damaged_bytes_truncated(self) -> int:
+        """Bytes truncated from the log during the last replay."""
+        return getattr(self, "_damaged_bytes_truncated", 0)
+
+    @property
+    def record_count(self) -> int:
+        """Number of valid records in the WAL."""
+        return getattr(self, "_record_count", 0)
+
+    @property
+    def file_size_bytes(self) -> int:
+        """Current size of the WAL file on disk in bytes."""
+        try:
+            return os.path.getsize(self._path)
+        except OSError:
+            return 0
+
 
     # -- Reset (used after flushing the memtable to an SSTable) ----------------
 

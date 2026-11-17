@@ -10,30 +10,35 @@ Usage:
 
 from __future__ import annotations
 
+import collections
 import os
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Deque, Dict, List, Optional
 
+from strata.compaction import merge_tables
+from strata.manifest import read_manifest, write_manifest
 from strata.memtable import MemTable
 from strata.sstable import SSTable, write_sstable
 from strata.wal import WriteAheadLog
 
 WAL_FILENAME = "wal.log"
 DEFAULT_MEMTABLE_LIMIT_BYTES = 4 * 1024 * 1024  # 4 MB default flush threshold
+DEFAULT_COMPACTION_THRESHOLD = 4               # Compact when >= 4 SSTables
 
 
 class Strata:
-    """A key-value store backed by a WAL, MemTable, and immutable SSTables.
+    """A key-value store backed by a WAL, MemTable, immutable SSTables, and compaction.
 
     Args:
-        data_dir: Directory where the database files live.  Created if
+        data_dir: Directory where the database files live. Created if
                   it does not exist.
-        sync:     If True, every write is fsync'd to disk.  Slower but
-                  crash-safe.
-        memtable_limit_bytes: In-memory byte threshold before the
-                              memtable is automatically flushed to a
-                              new SSTable on disk.
-        use_bloom: If True, uses in-memory Bloom filters to avoid disk
-                   reads for absent keys.
+        sync: If True, every write is fsync'd to disk. Slower but crash-safe.
+        memtable_limit_bytes: In-memory byte threshold before the memtable is
+                              automatically flushed to a new SSTable on disk.
+        use_bloom: If True, uses in-memory Bloom filters to avoid disk reads
+                   for absent keys.
+        compaction_threshold: Number of SSTables that triggers auto compaction.
+        auto_compact: Whether to trigger compaction automatically after flushes.
     """
 
     def __init__(
@@ -42,28 +47,55 @@ class Strata:
         sync: bool = True,
         memtable_limit_bytes: int = DEFAULT_MEMTABLE_LIMIT_BYTES,
         use_bloom: bool = True,
+        compaction_threshold: int = DEFAULT_COMPACTION_THRESHOLD,
+        auto_compact: bool = True,
     ) -> None:
         self._data_dir = data_dir
         self._sync = sync
         self._memtable_limit_bytes = memtable_limit_bytes
         self._use_bloom = use_bloom
+        self._compaction_threshold = compaction_threshold
+        self._auto_compact = auto_compact
 
-        # Counters for read performance and Stage 3/5 analytics
+        # Performance counters
         self._bloom_skips: int = 0
         self._disk_lookups: int = 0
         self._false_positives: int = 0
+        self._compactions_count: int = 0
+
+        # Event log
+        self._next_event_id: int = 1
+        self.events: Deque[Dict[str, Any]] = collections.deque(maxlen=500)
+        self.recovery_info: Dict[str, Any] = {}
 
         os.makedirs(data_dir, exist_ok=True)
 
         wal_path = os.path.join(data_dir, WAL_FILENAME)
         self._wal = WriteAheadLog(wal_path, sync=sync)
         self._mem = MemTable()
-        self._sstables: List[SSTable] = []
+        self._sstables: List[SSTable] = []  # Ordered newest-to-oldest in memory
         self._next_sst_id: int = 1
 
         # Recover on-disk SSTables and replay un-flushed WAL records.
         self._recover()
 
+    # -- Event Logging ---------------------------------------------------------
+
+    def _record_event(self, event_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Append an event to the ring buffer and return it."""
+        event = {
+            "id": self._next_event_id,
+            "time": time.time(),
+            "type": event_type,
+            **data,
+        }
+        self._next_event_id += 1
+        self.events.append(event)
+        return event
+
+    def events_since(self, event_id: int) -> List[Dict[str, Any]]:
+        """Return all events with id > event_id currently in the log buffer."""
+        return [ev for ev in self.events if ev["id"] > event_id]
 
     # -- Recovery --------------------------------------------------------------
 
@@ -71,51 +103,92 @@ class Strata:
         """Recover state from disk on startup.
 
         Order of operations:
-          1. Delete leftover *.tmp files in data_dir (unfinished flushes
-             interrupted by a crash).
-          2. Load every *.sst file, sorted by file sequence number
-             descending (newest first).  Age order matters: newest must
-             be checked first so newer updates and tombstones shadow older data.
-          3. Determine next SSTable number = highest existing + 1.
-          4. THEN replay the WAL into the memtable as before to reconstruct
-             all writes that happened after the last successful flush.
+          a) Delete leftover *.tmp files in data_dir (including MANIFEST.tmp
+             and any *.sst.tmp from interrupted flushes or compactions).
+          b) Read the MANIFEST. If it is None (fresh directory or legacy data),
+             ADOPT every *.sst file sorted by number (oldest to newest) and
+             write a MANIFEST.
+          c) Otherwise load exactly the listed files. A listed file that is
+             missing raises a clear FileNotFoundError.
+          d) Delete any *.sst file that is NOT in the manifest (orphans left
+             by a crash during flush or compaction).
+          e) Compute next file id = 1 + the highest number among ALL .sst
+             names seen BEFORE deleting orphans, so IDs are NEVER reused.
+          f) THEN replay the WAL into the memtable as before.
         """
-        # 1. Clean up stale temporary files from interrupted writes.
+        t0 = time.perf_counter()
+        tmp_removed = 0
+        orphans_removed = 0
+
+        # a) Clean up all *.tmp files.
         for fname in os.listdir(self._data_dir):
             if fname.endswith(".tmp"):
                 try:
                     os.remove(os.path.join(self._data_dir, fname))
+                    tmp_removed += 1
                 except OSError:
                     pass
 
-        # 2. Find and load all existing *.sst files.
-        sst_files: List[str] = [
-            f for f in os.listdir(self._data_dir)
-            if f.endswith(".sst")
-        ]
-
+        # Helper to extract integer sequence from "000005.sst"
         def _sst_seq(filename: str) -> int:
-            base = filename[:-4]
+            base = filename[:-4] if filename.endswith(".sst") else filename
             try:
                 return int(base)
             except ValueError:
                 return 0
 
-        # Sort descending by sequence number: e.g. 000003.sst before 000001.sst.
-        sst_files.sort(key=_sst_seq, reverse=True)
-
-        self._sstables = [
-            SSTable(os.path.join(self._data_dir, f))
-            for f in sst_files
+        # Discover ALL .sst files currently on disk (before orphan cleanup).
+        all_disk_sst_files = [
+            f for f in os.listdir(self._data_dir)
+            if f.endswith(".sst")
         ]
 
-        # 3. Next file number = highest existing + 1 (starts at 1).
-        if sst_files:
-            self._next_sst_id = max(_sst_seq(f) for f in sst_files) + 1
+        # e) Compute next file id = 1 + max seen among ALL .sst files BEFORE orphan deletion.
+        if all_disk_sst_files:
+            highest_seen = max(_sst_seq(f) for f in all_disk_sst_files)
+            self._next_sst_id = highest_seen + 1
         else:
             self._next_sst_id = 1
 
-        # 4. Replay the WAL into the memtable.
+        # b) Read MANIFEST
+        manifest_tables = read_manifest(self._data_dir)
+
+        if manifest_tables is None:
+            # Legacy or fresh directory: adopt all existing .sst files sorted oldest to newest.
+            all_disk_sst_files.sort(key=_sst_seq)
+            manifest_tables = list(all_disk_sst_files)
+            write_manifest(self._data_dir, manifest_tables, sync=self._sync)
+
+        # c) Load exactly the files listed in the manifest.
+        # Manifest lists tables oldest-to-newest; in-memory self._sstables is newest-to-oldest!
+        loaded_tables: List[SSTable] = []
+        manifest_set = set(manifest_tables)
+
+        # Check for missing files listed in the manifest
+        for name in manifest_tables:
+            path = os.path.join(self._data_dir, name)
+            if not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"MANIFEST lists SSTable {name!r}, but it does not exist on disk in {self._data_dir}"
+                )
+
+        # In-memory list is ordered NEWEST first (reversed manifest order)
+        for name in reversed(manifest_tables):
+            path = os.path.join(self._data_dir, name)
+            loaded_tables.append(SSTable(path))
+
+        self._sstables = loaded_tables
+
+        # d) Delete any *.sst file that is NOT in the manifest (orphans).
+        for f in all_disk_sst_files:
+            if f not in manifest_set:
+                try:
+                    os.remove(os.path.join(self._data_dir, f))
+                    orphans_removed += 1
+                except OSError:
+                    pass
+
+        # f) Replay the WAL into the memtable.
         records = self._wal.replay()
         for record in records:
             op = record.get("op")
@@ -124,42 +197,54 @@ class Strata:
             elif op == "del":
                 self._mem.delete(record["k"])
             else:
-                # An unknown op means the WAL is damaged or was written
-                # by a newer version we don't understand.  Fail loudly
-                # so the problem is noticed immediately.
-                raise ValueError(
-                    f"Unknown WAL operation: {op!r}"
-                )
+                raise ValueError(f"Unknown WAL operation: {op!r}")
+
+        duration_ms = (time.perf_counter() - t0) * 1000.0
+
+        # Record recovery event and info
+        self.recovery_info = {
+            "wal_records_replayed": len(records),
+            "damaged_bytes_truncated": self._wal.damaged_bytes_truncated,
+            "sstables_loaded": len(self._sstables),
+            "orphans_removed": orphans_removed,
+            "tmp_removed": tmp_removed,
+            "duration_ms": duration_ms,
+        }
+        self._record_event("recovery", self.recovery_info)
 
     # -- Flush -----------------------------------------------------------------
 
     def flush(self) -> None:
         """Flush the in-memory MemTable to a new sorted SSTable on disk.
 
-        The order of operations is critical for crash safety:
+        Order of operations:
           1. Write memtable.sorted_items() to the next numbered .sst file
              (write_sstable writes to .tmp, fsyncs, then atomically renames).
-          2. Open it as an SSTable and insert at the FRONT of self._sstables
+          2. Update the MANIFEST with the new file added to the list.
+             *** THIS IS THE COMMIT POINT ***
+          3. Open it as an SSTable and insert at the FRONT of self._sstables
              (newest first).
-          3. Only AFTER the file is safely on disk, reset the WAL (truncate
-             to empty and fsync) and replace the MemTable with a fresh empty one.
+          4. Only AFTER the file and manifest are safely on disk, reset the
+             WAL (truncate to empty and fsync) and replace the MemTable with a
+             fresh empty one.
+          5. Check auto_compact: if enabled and table count >= threshold,
+             trigger compact().
 
         Crash windows analysis:
-          - Crash BEFORE step 1 finishes:
-            The .tmp file is incomplete; no .sst file was created.
-            The WAL is intact and contains all mutations.  On recovery,
-            the leftover .tmp is deleted and the WAL is replayed into
-            the MemTable.  NO DATA IS LOST.
-          - Crash AFTER step 1/2 but BEFORE step 3 completes:
-            The SSTable is already safely on disk, but the WAL has not been
-            reset yet.  On restart, the engine loads the SSTable, then
-            replays the WAL into the MemTable.  Replaying the WAL entries
-            on top of the SSTable is harmless and idempotent because the
-            replayed values are identical to (or newer than) what was
-            persisted in the SSTable.  NO DATA IS LOST.
-          - Crash AFTER step 3:
-            The SSTable is on disk, WAL is clean/empty, and the fresh
-            MemTable starts clean.  NO DATA IS LOST.
+          - Crash BEFORE step 2 (manifest update):
+            The .sst file exists on disk (or its .tmp is present), but the
+            MANIFEST still lists only the old tables.  On startup, the unlisted
+            .sst is treated as an orphan and deleted.  The WAL still has
+            everything, so no acknowledged data is lost.
+          - Crash AFTER step 2 but BEFORE step 4 (WAL reset):
+            The MANIFEST already lists the new SSTable, but the WAL has not
+            been truncated yet.  On restart, the SSTable is loaded, and then
+            the WAL is replayed on top of it.  This is harmless and idempotent
+            because the replayed writes are identical to (or newer than) the
+            flushed SSTable records.  NO DATA IS LOST.
+          - Crash AFTER step 4:
+            The SSTable is in the manifest, the WAL is clean/empty, and the
+            fresh MemTable is ready.  NO DATA IS LOST.
         """
         # Never flush an empty memtable.
         if len(self._mem) == 0:
@@ -167,31 +252,150 @@ class Strata:
 
         sst_filename = f"{self._next_sst_id:06d}.sst"
         sst_path = os.path.join(self._data_dir, sst_filename)
+        items = self._mem.sorted_items()
+        records_count = len(items)
 
         # 1. Write sorted items to .sst atomically.
-        write_sstable(sst_path, self._mem.sorted_items(), sync=self._sync)
+        write_sstable(sst_path, items, sync=self._sync)
+        file_bytes = os.path.getsize(sst_path)
 
-        # 2. Open and insert at front (newest first).
+        # 2. Update MANIFEST (COMMIT POINT)
+        # Manifest order is oldest-to-newest, so new SSTable is appended at the end.
+        current_names_oldest_first = [s.name for s in reversed(self._sstables)]
+        current_names_oldest_first.append(sst_filename)
+        write_manifest(self._data_dir, current_names_oldest_first, sync=self._sync)
+
+        # 3. Open and insert at front (newest first).
         sstable = SSTable(sst_path)
         self._sstables.insert(0, sstable)
         self._next_sst_id += 1
 
-        # 3. Safely reset the WAL and start a fresh empty MemTable.
+        # 4. Safely reset the WAL and start a fresh empty MemTable.
         self._wal.reset()
         self._mem = MemTable()
+
+        # Log flush event
+        self._record_event("flush", {
+            "sstable": sst_filename,
+            "records": records_count,
+            "bytes": file_bytes,
+        })
+
+        # 5. Auto-compaction check
+        if self._auto_compact and len(self._sstables) >= self._compaction_threshold:
+            self.compact()
+
+    # -- Compaction ------------------------------------------------------------
+
+    def compact(self) -> Optional[Dict[str, Any]]:
+        """Merge ALL existing SSTables into a single sorted SSTable.
+
+        If there are fewer than 2 SSTables, returns None.
+
+        Order of operations:
+          1. Stream merge_tables(self._sstables, stats) into a new numbered
+             .sst file using the existing atomic write_sstable().
+             (If zero records survive because all were deleted/tombstones,
+             write no .sst file).
+          2. Open the new table (if created).
+          3. Write the MANIFEST listing ONLY the new table (or empty list []).
+             *** THIS IS THE COMMIT POINT ***
+          4. Swap the in-memory table list: self._sstables = [new_table] (or []).
+          5. Delete the old obsolete files from disk (ignore FileNotFoundError).
+
+        Crash windows analysis:
+          - Crash BEFORE step 3 (manifest update):
+            The merged file (or its .tmp) exists on disk, but the MANIFEST
+            still lists the old tables.  On startup, the uncommitted merged file
+            is detected as an orphan and deleted.  The old tables and the WAL
+            remain intact, exactly as before compaction.  NO DATA IS LOST.
+          - Crash AFTER step 3 but BEFORE step 5 (deleting old files):
+            The MANIFEST lists ONLY the new merged table.  The old tables are
+            still sitting on disk.  On startup, recovery loads only the merged
+            table from the manifest, and deletes the old unlisted tables as
+            orphans.  Because the old files are purged, deleted keys can NEVER
+            come back to life.  NO DATA IS LOST.
+        """
+        if len(self._sstables) < 2:
+            return None
+
+        t0 = time.perf_counter()
+        old_tables = list(self._sstables)  # Newest to oldest
+        input_names = [t.name for t in old_tables]
+        bytes_in = sum(t.file_size_bytes for t in old_tables)
+
+        merge_stats: Dict[str, Any] = {}
+        merged_generator = merge_tables(old_tables, merge_stats)
+
+        # 1. Stream merge into new .sst file
+        new_sst_name: Optional[str] = None
+        new_sst_path: Optional[str] = None
+        new_table: Optional[SSTable] = None
+        bytes_out = 0
+
+        # We need to know if any records survive. materialize generator into items
+        surviving_items = list(merged_generator)
+        records_out = len(surviving_items)
+
+        if records_out > 0:
+            new_sst_name = f"{self._next_sst_id:06d}.sst"
+            new_sst_path = os.path.join(self._data_dir, new_sst_name)
+            self._next_sst_id += 1
+
+            write_sstable(new_sst_path, surviving_items, sync=self._sync)
+            bytes_out = os.path.getsize(new_sst_path)
+
+            # 2. Open the new table
+            new_table = SSTable(new_sst_path)
+            new_manifest_list = [new_sst_name]
+        else:
+            # Zero records survived (all keys had tombstones)
+            new_manifest_list = []
+
+        # 3. Write MANIFEST (COMMIT POINT)
+        write_manifest(self._data_dir, new_manifest_list, sync=self._sync)
+
+        # 4. Swap in-memory table list
+        if new_table is not None:
+            self._sstables = [new_table]
+        else:
+            self._sstables = []
+
+        # 5. Delete old files
+        for tbl in old_tables:
+            try:
+                os.remove(tbl.path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+        self._compactions_count += 1
+        duration_ms = (time.perf_counter() - t0) * 1000.0
+
+        summary = {
+            "inputs": input_names,
+            "output": new_sst_name,
+            "records_in": merge_stats["records_in"],
+            "records_out": records_out,
+            "overwritten_dropped": merge_stats["overwritten_dropped"],
+            "tombstones_dropped": merge_stats["tombstones_dropped"],
+            "bytes_in": bytes_in,
+            "bytes_out": bytes_out,
+            "duration_ms": duration_ms,
+        }
+
+        # Log compaction event
+        self._record_event("compaction", summary)
+
+        return summary
 
     # -- Public API ------------------------------------------------------------
 
     def put(self, key: str, value: str) -> None:
         """Store a key-value pair.
 
-        We write to the WAL FIRST, then update the memtable.  Why?
-        If we updated the memtable first and crashed before the WAL
-        write, the in-memory change would be lost and the WAL would
-        have no record of it — so the write silently disappears.
-        By writing the WAL first, any write that the caller saw
-        complete is guaranteed to be on disk and recoverable.
-
+        We write to the WAL FIRST, then update the memtable.
         If the memtable exceeds memtable_limit_bytes, it is flushed.
         """
         _validate_key(key)
@@ -229,8 +433,8 @@ class Strata:
 
         Why tombstones must stop the search:
           If a key is found with value None (a tombstone), that means the
-          key was explicitly deleted in that generation.  We MUST return
-          None immediately without inspecting older SSTables.  If we kept
+          key was explicitly deleted in that generation. We MUST return
+          None immediately without inspecting older SSTables. If we kept
           searching older SSTables, an older non-deleted value would be
           found and resurrect the deleted key!
         """
@@ -268,6 +472,7 @@ class Strata:
 
     def stats(self) -> Dict[str, Any]:
         """Return database statistics for monitoring and Stage 5 dashboard."""
+        total_sst_bytes = sum(s.file_size_bytes for s in self._sstables)
         return {
             "memtable_keys": len(self._mem),
             "memtable_bytes": self._mem.size_bytes,
@@ -276,6 +481,12 @@ class Strata:
             "bloom_skips": self._bloom_skips,
             "disk_lookups": self._disk_lookups,
             "false_positives": self._false_positives,
+            "compactions": self._compactions_count,
+            "compaction_threshold": self._compaction_threshold,
+            "auto_compact": self._auto_compact,
+            "wal_bytes": self._wal.file_size_bytes,
+            "wal_records": self._wal.record_count,
+            "total_sstable_bytes": total_sst_bytes,
             "sstables": [
                 {
                     "name": sst.name,
@@ -287,7 +498,6 @@ class Strata:
                 for sst in self._sstables
             ],
         }
-
 
     def close(self) -> None:
         """Close the database, flushing the WAL."""
