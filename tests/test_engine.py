@@ -484,3 +484,48 @@ def test_empty_memtable_flush_noop(tmp_path):
         assert db.stats()["sstable_count"] == 0
         assert len([f for f in os.listdir(db_dir) if f.endswith(".sst")]) == 0
 
+
+def test_trace_get_and_counters(tmp_path):
+    """trace_get() and get() agree on results, and trace_get does not increment counters."""
+    db_dir = str(tmp_path / "db")
+    with Strata(db_dir, sync=False, memtable_limit_bytes=100, auto_compact=False) as db:
+        db.put("k01", "v01")
+        db.flush()
+        db.put("k02", "v02")
+        db.delete("k02")
+        db.flush()
+        db.put("k03", "v03")
+
+        # Initial counter state
+        initial_stats = db.stats()
+        skips0 = initial_stats["bloom_skips"]
+        lookups0 = initial_stats["disk_lookups"]
+        fp0 = initial_stats["false_positives"]
+
+        # Test trace_get on existing, deleted, and absent keys
+        for key in ["k01", "k02", "k03", "nonexistent"]:
+            tr = db.trace_get(key)
+            val = db.get(key)
+            if tr["found"]:
+                assert tr["value"] == val
+            else:
+                assert val is None
+            assert len(tr["steps"]) > 0
+
+        # Now test that trace_get specifically does not alter counters
+        st_after_get = db.stats()
+        skips1 = st_after_get["bloom_skips"]
+        lookups1 = st_after_get["disk_lookups"]
+        fp1 = st_after_get["false_positives"]
+
+        # Run 50 trace_get lookups
+        for _ in range(50):
+            db.trace_get("k01")
+            db.trace_get("nonexistent_key")
+
+        st_after_trace = db.stats()
+        assert st_after_trace["bloom_skips"] == skips1
+        assert st_after_trace["disk_lookups"] == lookups1
+        assert st_after_trace["false_positives"] == fp1
+
+

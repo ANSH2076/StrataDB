@@ -12,3 +12,4 @@ __pycache__/
 
 # Data directories created by tests
 test_data*/
+demo_data/

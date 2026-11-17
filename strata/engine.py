@@ -53,9 +53,10 @@ class Strata:
         self._data_dir = data_dir
         self._sync = sync
         self._memtable_limit_bytes = memtable_limit_bytes
-        self._use_bloom = use_bloom
+        self.memtable_limit_bytes = memtable_limit_bytes
+        self.use_bloom = use_bloom
+        self.auto_compact = auto_compact
         self._compaction_threshold = compaction_threshold
-        self._auto_compact = auto_compact
 
         # Performance counters
         self._bloom_skips: int = 0
@@ -282,7 +283,7 @@ class Strata:
         })
 
         # 5. Auto-compaction check
-        if self._auto_compact and len(self._sstables) >= self._compaction_threshold:
+        if self.auto_compact and len(self._sstables) >= self._compaction_threshold:
             self.compact()
 
     # -- Compaction ------------------------------------------------------------
@@ -417,58 +418,175 @@ class Strata:
         if self._mem.size_bytes >= self._memtable_limit_bytes:
             self.flush()
 
-    def get(self, key: str) -> Optional[str]:
-        """Return the value for a key, or None if missing or deleted.
+    def _lookup(
+        self,
+        key: str,
+        trace: Optional[List[Dict[str, str]]] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        """Internal lookup shared by get() and trace_get() so they can never disagree.
 
-        Search order:
-          1. In-memory MemTable (most recent mutations).
-          2. SSTables from newest to oldest.
+        When trace is None:
+          - Regular read path.
+          - Updates engine performance counters (bloom_skips, disk_lookups, false_positives).
 
-        SSTable lookup steps:
-          a) Range check (first_key..last_key): cheap in-memory check, no disk.
-          b) Bloom check: if use_bloom and not table.might_contain(key),
-             increment bloom_skips and skip disk read entirely.
-          c) Real disk lookup: increment disk_lookups, call table.get(key).
-             If found=False, increment false_positives.
+        When trace is a list:
+          - Tracing mode.
+          - Appends step dictionaries to trace list.
+          - Does NOT modify engine counters.
 
-        Why tombstones must stop the search:
-          If a key is found with value None (a tombstone), that means the
-          key was explicitly deleted in that generation. We MUST return
-          None immediately without inspecting older SSTables. If we kept
-          searching older SSTables, an older non-deleted value would be
-          found and resurrect the deleted key!
+        Returns (found, value):
+          - (True, "str")  -> Key found with value.
+          - (True, None)   -> Tombstone found (key was deleted).
+          - (False, None)  -> Key not found anywhere.
         """
         _validate_key(key)
+        is_tracing = trace is not None
 
-        # 1. Check MemTable first.
-        found, value = self._mem.get(key)
+        # 1. Check MemTable
+        found, val = self._mem.get(key)
         if found:
-            return value
+            if val is not None:
+                if is_tracing:
+                    trace.append({
+                        "where": "memtable",
+                        "action": "hit",
+                        "detail": f"Found key in memory with value: {val!r}",
+                    })
+                return (True, val)
+            else:
+                # Tombstone in MemTable
+                if is_tracing:
+                    trace.append({
+                        "where": "memtable",
+                        "action": "tombstone",
+                        "detail": "Found tombstone in memory (key deleted)",
+                    })
+                return (True, None)
+        else:
+            if is_tracing:
+                trace.append({
+                    "where": "memtable",
+                    "action": "miss",
+                    "detail": "Key not present in memory",
+                })
 
-        # 2. Check SSTables newest to oldest.
+        # 2. Check SSTables from newest to oldest
         for sstable in self._sstables:
-            # a) Range check (first_key..last_key): cheap in-memory check, no disk.
+            sst_name = sstable.name
+
+            # Step a: Range check
             if sstable.record_count == 0:
+                if is_tracing:
+                    trace.append({
+                        "where": sst_name,
+                        "action": "range_skip",
+                        "detail": "Table is empty",
+                    })
                 continue
+
             if key < sstable.first_key or key > sstable.last_key:
+                if is_tracing:
+                    trace.append({
+                        "where": sst_name,
+                        "action": "range_skip",
+                        "detail": f"Key outside bounds [{sstable.first_key!r} .. {sstable.last_key!r}]",
+                    })
                 continue
 
-            # b) Bloom filter check: skip disk lookup if key is absent.
-            if self._use_bloom and not sstable.might_contain(key):
-                self._bloom_skips += 1
+            # Step b: Bloom filter check
+            if self.use_bloom and not sstable.might_contain(key):
+                if not is_tracing:
+                    self._bloom_skips += 1
+                else:
+                    trace.append({
+                        "where": sst_name,
+                        "action": "bloom_skip",
+                        "detail": "Bloom filter says definitely absent (disk read saved)",
+                    })
                 continue
 
-            # c) Real disk lookup.
-            self._disk_lookups += 1
-            found, value = sstable.get(key)
+            # Step c: Real disk read
+            if not is_tracing:
+                self._disk_lookups += 1
+
+            found, val = sstable.get(key)
             if found:
-                return value
-            elif self._use_bloom:
-                # The filter said might_contain=True, but disk lookup was not found.
-                self._false_positives += 1
+                if val is not None:
+                    if is_tracing:
+                        trace.append({
+                            "where": sst_name,
+                            "action": "disk_read_hit",
+                            "detail": f"Read from disk; found value: {val!r}",
+                        })
+                    return (True, val)
+                else:
+                    # Tombstone in SSTable
+                    if is_tracing:
+                        trace.append({
+                            "where": sst_name,
+                            "action": "tombstone",
+                            "detail": "Read from disk; found tombstone (key deleted)",
+                        })
+                    return (True, None)
+            else:
+                # Key was inside range and passed bloom filter, but was not on disk!
+                if self.use_bloom:
+                    if not is_tracing:
+                        self._false_positives += 1
+                    else:
+                        trace.append({
+                            "where": sst_name,
+                            "action": "disk_read_miss",
+                            "detail": "Bloom filter false positive; read from disk but key was absent",
+                        })
+                else:
+                    if is_tracing:
+                        trace.append({
+                            "where": sst_name,
+                            "action": "disk_read_miss",
+                            "detail": "Read from disk; key was absent",
+                        })
 
-        # Not found anywhere.
+        # Not found in any level
+        return (False, None)
+
+    def get(self, key: str) -> Optional[str]:
+        """Return the value for a key, or None if missing or deleted."""
+        found, val = self._lookup(key, trace=None)
+        if found:
+            return val
         return None
+
+    def trace_get(self, key: str) -> Dict[str, Any]:
+        """Trace the exact lookup path for a key across MemTable and SSTables.
+
+        Does NOT update performance counters (bloom_skips, disk_lookups, false_positives).
+        Guaranteed to return the exact same outcome as get(key).
+
+        Returns:
+            {
+                "key": key,
+                "found": bool,
+                "value": Optional[str],
+                "steps": list of step dicts
+            }
+        """
+        steps: List[Dict[str, str]] = []
+        found, val = self._lookup(key, trace=steps)
+        return {
+            "key": key,
+            "found": found and (val is not None),
+            "value": val,
+            "steps": steps,
+        }
+
+    def _abandon(self) -> None:
+        """Close only the WAL file handle with NO flush of the memtable and no cleanup.
+
+        Simulates an abrupt process crash for testing crash recovery.
+        """
+        self._wal.close()
+
 
     def stats(self) -> Dict[str, Any]:
         """Return database statistics for monitoring and Stage 5 dashboard."""
@@ -477,13 +595,13 @@ class Strata:
             "memtable_keys": len(self._mem),
             "memtable_bytes": self._mem.size_bytes,
             "sstable_count": len(self._sstables),
-            "bloom_enabled": self._use_bloom,
+            "bloom_enabled": self.use_bloom,
             "bloom_skips": self._bloom_skips,
             "disk_lookups": self._disk_lookups,
             "false_positives": self._false_positives,
             "compactions": self._compactions_count,
             "compaction_threshold": self._compaction_threshold,
-            "auto_compact": self._auto_compact,
+            "auto_compact": self.auto_compact,
             "wal_bytes": self._wal.file_size_bytes,
             "wal_records": self._wal.record_count,
             "total_sstable_bytes": total_sst_bytes,
