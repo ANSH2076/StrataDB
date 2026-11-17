@@ -1,0 +1,813 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Strata — Glass Box LSM Database Dashboard</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --card-bg: #161b22;
+      --border: #30363d;
+      --text: #c9d1d9;
+      --text-muted: #8b949e;
+      --accent: #58a6ff;
+      --success: #3fb950;
+      --warning: #d29922;
+      --danger: #f85149;
+      --purple: #bc8cff;
+      --cyan: #39c5cf;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      * {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+      }
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      padding: 16px;
+    }
+
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 16px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .brand h1 {
+      font-size: 20px;
+      font-weight: 700;
+      color: #fff;
+      letter-spacing: -0.5px;
+    }
+
+    .live-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(63, 185, 80, 0.15);
+      color: var(--success);
+      padding: 3px 8px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 600;
+      border: 1px solid rgba(63, 185, 80, 0.3);
+    }
+    .pulse-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--success);
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }
+
+    button {
+      background: #21262d;
+      color: #c9d1d9;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 12px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    button:hover {
+      background: #30363d;
+      border-color: #8b949e;
+      color: #fff;
+    }
+    button.primary {
+      background: #238636;
+      border-color: #2ea043;
+      color: #fff;
+    }
+    button.primary:hover {
+      background: #2ea043;
+    }
+    button.danger {
+      background: rgba(248, 81, 73, 0.15);
+      border-color: rgba(248, 81, 73, 0.4);
+      color: var(--danger);
+    }
+    button.danger:hover {
+      background: rgba(248, 81, 73, 0.25);
+    }
+
+    .toggle-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--text-muted);
+      cursor: pointer;
+      user-select: none;
+      background: #161b22;
+      padding: 5px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+    }
+
+    .grid-layout {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 16px;
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .card-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    /* Stat Cards */
+    .col-3 { grid-column: span 3; }
+    .col-4 { grid-column: span 4; }
+    .col-6 { grid-column: span 6; }
+    .col-8 { grid-column: span 8; }
+    .col-12 { grid-column: span 12; }
+
+    @media (max-width: 900px) {
+      .col-3, .col-4, .col-6, .col-8 { grid-column: span 12; }
+    }
+
+    .stat-number {
+      font-size: 24px;
+      font-weight: 700;
+      color: #fff;
+    }
+    .stat-meta {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    /* Write Path */
+    .meter-container {
+      background: #21262d;
+      border-radius: 6px;
+      height: 14px;
+      width: 100%;
+      overflow: hidden;
+      margin-top: 4px;
+    }
+    .meter-bar {
+      background: var(--accent);
+      height: 100%;
+      width: 0%;
+      transition: width 0.3s ease;
+    }
+
+    /* SSTables Stack */
+    .sst-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 380px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+    .sst-block {
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--cyan);
+      border-radius: 6px;
+      padding: 10px 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      transition: transform 0.3s ease, opacity 0.3s ease, border-color 0.2s;
+    }
+    .sst-block.newest {
+      border-left-color: var(--accent);
+    }
+    .sst-name {
+      font-family: monospace;
+      font-size: 13px;
+      font-weight: 700;
+      color: #fff;
+    }
+    .sst-meta {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+
+    /* Tracer */
+    .tracer-form {
+      display: flex;
+      gap: 8px;
+    }
+    .tracer-form input {
+      flex: 1;
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 12px;
+      color: #fff;
+      font-size: 13px;
+    }
+    .tracer-form input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    .timeline {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 8px;
+      min-height: 80px;
+    }
+    .timeline-step {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-size: 12px;
+      animation: fadeIn 0.2s ease;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(-4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+    .badge-range_skip { background: rgba(139, 148, 158, 0.2); color: var(--text-muted); }
+    .badge-bloom_skip { background: rgba(88, 166, 255, 0.15); color: var(--accent); }
+    .badge-disk_read_hit { background: rgba(63, 185, 80, 0.2); color: var(--success); }
+    .badge-disk_read_miss { background: rgba(210, 153, 34, 0.2); color: var(--warning); }
+    .badge-hit { background: rgba(63, 185, 80, 0.2); color: var(--success); }
+    .badge-tombstone { background: rgba(248, 81, 73, 0.2); color: var(--danger); }
+    .badge-miss { background: rgba(139, 148, 158, 0.2); color: var(--text-muted); }
+
+    /* Event Feed */
+    .event-feed {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: 250px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+    .event-item {
+      font-size: 12px;
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 7px 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+    .event-time {
+      font-size: 10px;
+      color: var(--text-muted);
+      font-family: monospace;
+    }
+
+    /* Crash Banner */
+    .crash-banner {
+      background: rgba(248, 81, 73, 0.1);
+      border: 1px solid rgba(248, 81, 73, 0.3);
+      border-radius: 6px;
+      padding: 10px 14px;
+      display: none;
+      font-size: 12px;
+    }
+    .crash-banner.active {
+      display: block;
+    }
+
+    footer {
+      margin-top: 24px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
+      font-size: 11px;
+      color: var(--text-muted);
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <div class="brand">
+      <h1>Strata</h1>
+      <div class="live-badge">
+        <span class="pulse-dot"></span>
+        <span id="conn-status">CONNECTED</span>
+      </div>
+    </div>
+    <div class="controls">
+      <button id="btn-load-100">⚡ Write 100</button>
+      <button id="btn-load-1000">🚀 Write 1,000</button>
+      <button id="btn-compact" class="primary">📦 Compact Now</button>
+      <button id="btn-crash" class="danger">💥 Simulate Crash</button>
+      <button id="btn-reset">↺ Reset</button>
+
+      <label class="toggle-label">
+        <input type="checkbox" id="toggle-bloom" checked>
+        <span>Bloom Filters</span>
+      </label>
+      <label class="toggle-label">
+        <input type="checkbox" id="toggle-autocompact" checked>
+        <span>Auto-Compaction</span>
+      </label>
+    </div>
+  </header>
+
+  <!-- Crash Banner -->
+  <div id="crash-banner" class="crash-banner">
+    <strong id="crash-headline" style="color: var(--danger)">SIMULATED CRASH RECOVERY</strong>
+    <p id="crash-detail" style="margin-top: 4px;"></p>
+  </div>
+
+  <!-- Main Grid -->
+  <main class="grid-layout" style="margin-top: 16px;">
+
+    <!-- Stat Cards -->
+    <div class="card col-3">
+      <div class="card-title">SSTables Live</div>
+      <div class="stat-number" id="stat-sst-count">0</div>
+      <div class="stat-meta" id="stat-sst-bytes">0 KB total disk</div>
+    </div>
+    <div class="card col-3">
+      <div class="card-title">Bloom Skips (Saved Reads)</div>
+      <div class="stat-number" id="stat-bloom-skips" style="color: var(--accent);">0</div>
+      <div class="stat-meta">Disk seeks avoided</div>
+    </div>
+    <div class="card col-3">
+      <div class="card-title">Disk Lookups & False Positives</div>
+      <div class="stat-number" id="stat-disk-lookups">0</div>
+      <div class="stat-meta" id="stat-fp-rate">0 false positives (0.0%)</div>
+    </div>
+    <div class="card col-3">
+      <div class="card-title">Compactions Run</div>
+      <div class="stat-number" id="stat-compactions" style="color: var(--purple);">0</div>
+      <div class="stat-meta" id="stat-compaction-threshold">Threshold: 4 tables</div>
+    </div>
+
+    <!-- Write Path (WAL & MemTable) -->
+    <div class="card col-6">
+      <div class="card-title">
+        <span>Write Path — MemTable & WAL</span>
+        <span id="memtable-ratio">0 / 0 B</span>
+      </div>
+      <div>
+        <div style="display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 2px;">
+          <span>MemTable In-Memory Buffer</span>
+          <span id="memtable-keys-count">0 keys</span>
+        </div>
+        <div class="meter-container">
+          <div class="meter-bar" id="memtable-meter"></div>
+        </div>
+      </div>
+      <div style="margin-top: 8px; font-size: 12px; color: var(--text-muted); display: flex; justify-content: space-between;">
+        <span>WAL Append Log: <strong id="wal-records-count" style="color: #fff;">0</strong> records</span>
+        <span id="wal-bytes-count">0 KB</span>
+      </div>
+    </div>
+
+    <!-- Lookup Tracer -->
+    <div class="card col-6">
+      <div class="card-title">Lookup Tracer (Glass Box Step-by-Step)</div>
+      <form class="tracer-form" id="trace-form">
+        <input type="text" id="trace-key-input" placeholder="Enter key (e.g. user_000042)" required>
+        <button type="submit" class="primary">Trace Lookup</button>
+      </form>
+      <div class="timeline" id="tracer-timeline">
+        <div style="font-size: 12px; color: var(--text-muted); text-align: center; padding: 20px;">
+          Enter a key above to trace the traversal across memory, bounds checks, bloom filters, and disk.
+        </div>
+      </div>
+    </div>
+
+    <!-- On-Disk SSTables Stack -->
+    <div class="card col-8">
+      <div class="card-title">
+        <span>On-Disk SSTables (Newest to Oldest)</span>
+        <span id="sst-count-badge">0 tables</span>
+      </div>
+      <div class="sst-stack" id="sst-stack-container">
+        <div style="font-size: 12px; color: var(--text-muted); text-align: center; padding: 30px;">
+          No SSTables on disk yet. Write keys to fill the MemTable and trigger a flush.
+        </div>
+      </div>
+    </div>
+
+    <!-- Event Log -->
+    <div class="card col-4">
+      <div class="card-title">Live Engine Event Stream</div>
+      <div class="event-feed" id="event-feed-container">
+        <div style="font-size: 12px; color: var(--text-muted); text-align: center; padding: 20px;">
+          Awaiting engine events...
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- Footer -->
+  <footer>
+    Strata LSM Storage Engine · Stage 5 Glass Box Dashboard · Note: The simulated crash button tests in-process recovery. The true process-kill test runs via tests/crash_test.py.
+  </footer>
+
+  <script>
+    // State tracking
+    let lastEventId = 0;
+    let isTracing = false;
+
+    // DOM Elements
+    const connStatus = document.getElementById("conn-status");
+    const statSstCount = document.getElementById("stat-sst-count");
+    const statSstBytes = document.getElementById("stat-sst-bytes");
+    const statBloomSkips = document.getElementById("stat-bloom-skips");
+    const statDiskLookups = document.getElementById("stat-disk-lookups");
+    const statFpRate = document.getElementById("stat-fp-rate");
+    const statCompactions = document.getElementById("stat-compactions");
+    const statCompactionThreshold = document.getElementById("stat-compaction-threshold");
+    const memtableRatio = document.getElementById("memtable-ratio");
+    const memtableKeysCount = document.getElementById("memtable-keys-count");
+    const memtableMeter = document.getElementById("memtable-meter");
+    const walRecordsCount = document.getElementById("wal-records-count");
+    const walBytesCount = document.getElementById("wal-bytes-count");
+    const sstStackContainer = document.getElementById("sst-stack-container");
+    const sstCountBadge = document.getElementById("sst-count-badge");
+    const eventFeedContainer = document.getElementById("event-feed-container");
+    const crashBanner = document.getElementById("crash-banner");
+    const crashHeadline = document.getElementById("crash-headline");
+    const crashDetail = document.getElementById("crash-detail");
+    const traceForm = document.getElementById("trace-form");
+    const traceKeyInput = document.getElementById("trace-key-input");
+    const tracerTimeline = document.getElementById("tracer-timeline");
+    const toggleBloom = document.getElementById("toggle-bloom");
+    const toggleAutoCompact = document.getElementById("toggle-autocompact");
+
+    // Format byte sizes cleanly
+    function formatBytes(bytes) {
+      if (bytes === 0) return "0 B";
+      const k = 1024;
+      const sizes = ["B", "KB", "MB", "GB"];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return (bytes / Math.pow(k, i)).toFixed(1) + " " + sizes[i];
+    }
+
+    // Safe API helper
+    async function apiRequest(endpoint, method = "GET", body = null) {
+      try {
+        const options = { method, headers: {} };
+        if (body) {
+          options.headers["Content-Type"] = "application/json";
+          options.body = JSON.stringify(body);
+        }
+        const resp = await fetch(endpoint, options);
+        if (!resp.ok) {
+          const errData = await resp.json().catch(() => ({}));
+          throw new Error(errData.error || `HTTP ${resp.status}`);
+        }
+        return await resp.json();
+      } catch (err) {
+        console.error("API error:", err);
+        connStatus.textContent = "DISCONNECTED";
+        throw err;
+      }
+    }
+
+    // Polling function for /api/state?since=ID
+    async function pollState() {
+      try {
+        const data = await apiRequest(`/api/state?since=${lastEventId}`);
+        connStatus.textContent = "CONNECTED";
+        renderState(data);
+      } catch (e) {
+        // Retry on next tick
+      } finally {
+        setTimeout(pollState, 400);
+      }
+    }
+
+    function renderState(data) {
+      const stats = data.stats;
+      const memLimit = data.memtable_limit_bytes || 4194304;
+
+      // Stat cards
+      statSstCount.textContent = stats.sstable_count;
+      statSstBytes.textContent = formatBytes(stats.total_sstable_bytes) + " total disk";
+      statBloomSkips.textContent = stats.bloom_skips.toLocaleString();
+      statDiskLookups.textContent = stats.disk_lookups.toLocaleString();
+
+      const fps = stats.false_positives || 0;
+      const looks = stats.disk_lookups || 0;
+      const fpPct = looks > 0 ? ((fps / looks) * 100).toFixed(1) : "0.0";
+      statFpRate.textContent = `${fps} false positives (${fpPct}%)`;
+
+      statCompactions.textContent = stats.compactions;
+      statCompactionThreshold.textContent = `Auto threshold: ${stats.compaction_threshold} tables`;
+
+      // Settings checkboxes
+      toggleBloom.checked = stats.bloom_enabled;
+      toggleAutoCompact.checked = stats.auto_compact;
+
+      // Write path (MemTable & WAL)
+      const memBytes = stats.memtable_bytes || 0;
+      const pct = Math.min(100, Math.round((memBytes / memLimit) * 100));
+      memtableRatio.textContent = `${formatBytes(memBytes)} / ${formatBytes(memLimit)}`;
+      memtableKeysCount.textContent = `${stats.memtable_keys} keys`;
+      memtableMeter.style.width = `${pct}%`;
+
+      walRecordsCount.textContent = (stats.wal_records || 0).toLocaleString();
+      walBytesCount.textContent = formatBytes(stats.wal_bytes || 0);
+
+      // SSTables Stack (Newest to Oldest)
+      renderSSTables(stats.sstables || []);
+
+      // Events
+      if (data.events && data.events.length > 0) {
+        renderEvents(data.events);
+      }
+    }
+
+    function renderSSTables(sstables) {
+      sstCountBadge.textContent = `${sstables.length} tables`;
+      if (sstables.length === 0) {
+        sstStackContainer.textContent = "";
+        const emptyDiv = document.createElement("div");
+        emptyDiv.style.cssText = "font-size: 12px; color: var(--text-muted); text-align: center; padding: 30px;";
+        emptyDiv.textContent = "No SSTables on disk yet. Write keys to fill the MemTable and trigger a flush.";
+        sstStackContainer.appendChild(emptyDiv);
+        return;
+      }
+
+      // Rebuild SSTable stack safely using DOM methods
+      sstStackContainer.textContent = "";
+      sstables.forEach((sst, idx) => {
+        const block = document.createElement("div");
+        block.className = `sst-block ${idx === 0 ? "newest" : ""}`;
+
+        const leftDiv = document.createElement("div");
+        const nameDiv = document.createElement("div");
+        nameDiv.className = "sst-name";
+        nameDiv.textContent = `${sst.name} ${idx === 0 ? "★ (Newest)" : ""}`;
+
+        const metaDiv = document.createElement("div");
+        metaDiv.className = "sst-meta";
+        metaDiv.textContent = `Range: [${sst.first_key || "-"} .. ${sst.last_key || "-"}]`;
+
+        leftDiv.appendChild(nameDiv);
+        leftDiv.appendChild(metaDiv);
+
+        const rightDiv = document.createElement("div");
+        rightDiv.style.textAlign = "right";
+
+        const recDiv = document.createElement("div");
+        recDiv.style.fontWeight = "600";
+        recDiv.style.color = "#fff";
+        recDiv.textContent = `${sst.record_count.toLocaleString()} keys`;
+
+        const sizeDiv = document.createElement("div");
+        sizeDiv.className = "sst-meta";
+        sizeDiv.textContent = formatBytes(sst.file_size_bytes);
+
+        rightDiv.appendChild(recDiv);
+        rightDiv.appendChild(sizeDiv);
+
+        block.appendChild(leftDiv);
+        block.appendChild(rightDiv);
+        sstStackContainer.appendChild(block);
+      });
+    }
+
+    function renderEvents(newEvents) {
+      if (eventFeedContainer.querySelector("div[style*='text-align: center']")) {
+        eventFeedContainer.textContent = "";
+      }
+
+      newEvents.forEach(ev => {
+        if (ev.id > lastEventId) lastEventId = ev.id;
+
+        const item = document.createElement("div");
+        item.className = "event-item";
+
+        const badge = document.createElement("span");
+        badge.className = "badge";
+
+        const desc = document.createElement("span");
+        desc.style.flex = "1";
+        desc.style.wordBreak = "break-all";
+
+        if (ev.type === "flush") {
+          badge.className += " badge-hit";
+          badge.textContent = "FLUSH";
+          desc.textContent = `Flushed ${ev.sstable} (${ev.records} keys, ${formatBytes(ev.bytes)})`;
+        } else if (ev.type === "compaction") {
+          badge.className += " badge-bloom_skip";
+          badge.textContent = "COMPACT";
+          desc.textContent = `Merged ${ev.inputs ? ev.inputs.length : 0} tables -> ${ev.output || "empty"} (dropped ${ev.overwritten_dropped} overwrites, ${ev.tombstones_dropped} tombstones in ${ev.duration_ms ? ev.duration_ms.toFixed(1) : 0}ms)`;
+        } else if (ev.type === "recovery") {
+          badge.className += " badge-range_skip";
+          badge.textContent = "RECOVERY";
+          desc.textContent = `Replayed ${ev.wal_records_replayed} records, loaded ${ev.sstables_loaded} tables, purged ${ev.orphans_removed} orphans in ${ev.duration_ms ? ev.duration_ms.toFixed(1) : 0}ms`;
+        } else {
+          badge.textContent = ev.type.toUpperCase();
+          desc.textContent = JSON.stringify(ev);
+        }
+
+        const timeSpan = document.createElement("span");
+        timeSpan.className = "event-time";
+        const d = new Date(ev.time * 1000);
+        timeSpan.textContent = d.toTimeString().split(" ")[0];
+
+        item.appendChild(badge);
+        item.appendChild(desc);
+        item.appendChild(timeSpan);
+
+        eventFeedContainer.insertBefore(item, eventFeedContainer.firstChild);
+      });
+    }
+
+    // Action button listeners
+    document.getElementById("btn-load-100").addEventListener("click", async () => {
+      await apiRequest("/api/load", "POST", { count: 100 });
+    });
+
+    document.getElementById("btn-load-1000").addEventListener("click", async () => {
+      await apiRequest("/api/load", "POST", { count: 1000 });
+    });
+
+    document.getElementById("btn-compact").addEventListener("click", async () => {
+      await apiRequest("/api/compact", "POST");
+    });
+
+    document.getElementById("btn-crash").addEventListener("click", async () => {
+      const res = await apiRequest("/api/crash", "POST");
+      crashBanner.classList.add("active");
+      const rec = res.recovery_info || {};
+      crashHeadline.textContent = `Simulated Crash & Reopen: ${rec.duration_ms ? rec.duration_ms.toFixed(1) : 0} ms`;
+      crashDetail.textContent = `Replayed ${rec.wal_records_replayed} WAL records, loaded ${rec.sstables_loaded} SSTables, removed ${rec.orphans_removed} orphan files. Checked ${res.checked} sampled keys: ${res.mismatches} mismatches.`;
+    });
+
+    document.getElementById("btn-reset").addEventListener("click", async () => {
+      if (confirm("Reset database to clean empty state?")) {
+        await apiRequest("/api/reset", "POST");
+        crashBanner.classList.remove("active");
+      }
+    });
+
+    toggleBloom.addEventListener("change", async () => {
+      await apiRequest("/api/settings", "POST", { bloom: toggleBloom.checked });
+    });
+
+    toggleAutoCompact.addEventListener("change", async () => {
+      await apiRequest("/api/settings", "POST", { auto_compact: toggleAutoCompact.checked });
+    });
+
+    // Lookup Tracer Animation (150 ms per step)
+    traceForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      if (isTracing) return;
+
+      const key = traceKeyInput.value.trim();
+      if (!key) return;
+
+      isTracing = true;
+      tracerTimeline.textContent = "";
+
+      const loadingMsg = document.createElement("div");
+      loadingMsg.style.cssText = "font-size: 12px; color: var(--accent); padding: 10px;";
+      loadingMsg.textContent = `Tracing lookup path for ${key}...`;
+      tracerTimeline.appendChild(loadingMsg);
+
+      try {
+        const traceRes = await apiRequest(`/api/trace?key=${encodeURIComponent(key)}`);
+        tracerTimeline.textContent = "";
+
+        const steps = traceRes.steps || [];
+        if (steps.length === 0) {
+          const emptyStep = document.createElement("div");
+          emptyStep.textContent = "No lookup steps reported.";
+          tracerTimeline.appendChild(emptyStep);
+          isTracing = false;
+          return;
+        }
+
+        // Animate reveal step by step (150ms apart)
+        for (let i = 0; i < steps.length; i++) {
+          await new Promise(r => setTimeout(r, 150));
+          const step = steps[i];
+
+          const stepEl = document.createElement("div");
+          stepEl.className = "timeline-step";
+
+          const badge = document.createElement("span");
+          badge.className = `badge badge-${step.action}`;
+
+          // Friendly label
+          let actionLabel = step.action.replace("_", " ").toUpperCase();
+          if (step.action === "bloom_skip") actionLabel = "BLOOM SKIP (READ SAVED)";
+          badge.textContent = actionLabel;
+
+          const whereSpan = document.createElement("strong");
+          whereSpan.style.color = "#fff";
+          whereSpan.style.minWidth = "80px";
+          whereSpan.textContent = step.where;
+
+          const detailSpan = document.createElement("span");
+          detailSpan.style.color = "var(--text-muted)";
+          detailSpan.style.flex = "1";
+          detailSpan.textContent = step.detail;
+
+          stepEl.appendChild(badge);
+          stepEl.appendChild(whereSpan);
+          stepEl.appendChild(detailSpan);
+          tracerTimeline.appendChild(stepEl);
+        }
+
+        // Final result badge
+        const finalEl = document.createElement("div");
+        finalEl.style.cssText = "margin-top: 6px; padding: 6px 12px; border-radius: 6px; font-weight: 600; font-size: 12px;";
+        if (traceRes.found) {
+          finalEl.style.background = "rgba(63, 185, 80, 0.15)";
+          finalEl.style.color = "var(--success)";
+          finalEl.textContent = `✓ Key found: ${JSON.stringify(traceRes.value)}`;
+        } else {
+          finalEl.style.background = "rgba(139, 148, 158, 0.15)";
+          finalEl.style.color = "var(--text-muted)";
+          finalEl.textContent = "✗ Key not found (or deleted by tombstone)";
+        }
+        tracerTimeline.appendChild(finalEl);
+
+      } catch (err) {
+        tracerTimeline.textContent = "";
+        const errEl = document.createElement("div");
+        errEl.style.color = "var(--danger)";
+        errEl.textContent = `Trace error: ${err.message}`;
+        tracerTimeline.appendChild(errEl);
+      } finally {
+        isTracing = false;
+      }
+    });
+
+    // Start polling loop
+    pollState();
+  </script>
+</body>
+</html>
