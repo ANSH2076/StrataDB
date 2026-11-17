@@ -36,6 +36,7 @@ def write_manifest(data_dir: str, sstable_names: List[str], sync: bool = True) -
       4. fsync the directory (best-effort; Windows does not support directory
          fsync so we catch and ignore OSError).
     """
+    os.makedirs(data_dir, exist_ok=True)
     tmp_path = os.path.join(data_dir, MANIFEST_TMP_FILENAME)
     target_path = os.path.join(data_dir, MANIFEST_FILENAME)
 
