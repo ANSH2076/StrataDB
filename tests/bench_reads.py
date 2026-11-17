@@ -1,7 +1,8 @@
-"""Benchmark script: Read performance with Bloom filter ON vs OFF.
+"""Benchmark script: Read performance across Bloom filter and Compaction.
 
-Tests 5,000 lookups of ABSENT keys and 5,000 lookups of PRESENT keys
-across 20,000 keys distributed across many SSTables.
+Tests:
+  1. Part 1: Bloom filter ON vs OFF across 46 uncompacted SSTables (5,000 absent & present lookups).
+  2. Part 2: Compaction benchmark: compact all SSTables into 1 table, timing lookups before and after.
 
 Usage:
     python3 tests/bench_reads.py
@@ -23,16 +24,22 @@ from strata import Strata
 
 NUM_TOTAL_KEYS = 20_000
 NUM_LOOKUPS = 5_000
-MEMTABLE_LIMIT_BYTES = 16 * 1024  # 16 KB to produce ~35-40 SSTables
+MEMTABLE_LIMIT_BYTES = 16 * 1024  # 16 KB to produce ~35-46 SSTables
 
 
 def setup_benchmark_db(data_dir: str) -> int:
-    """Populate database with NUM_TOTAL_KEYS and return number of SSTables created."""
+    """Populate database with NUM_TOTAL_KEYS with auto_compact=False."""
     print(f"Setting up database with {NUM_TOTAL_KEYS:,} keys...")
-    with Strata(data_dir, sync=False, memtable_limit_bytes=MEMTABLE_LIMIT_BYTES) as db:
+    with Strata(data_dir, sync=False, memtable_limit_bytes=MEMTABLE_LIMIT_BYTES, auto_compact=False) as db:
         for i in range(NUM_TOTAL_KEYS):
-            # Pad keys to ensure natural lexicographical alignment
+            # Introduce ~10% overwrites to test compaction deduplication
             db.put(f"user_{i:06d}", f"profile_data_payload_{i:06d}")
+        # Overwrite 2,000 keys
+        for i in range(0, 2000):
+            db.put(f"user_{i:06d}", f"updated_payload_{i:06d}")
+        # Delete 500 keys
+        for i in range(2000, 2500):
+            db.delete(f"user_{i:06d}")
 
     sst_count = len([f for f in os.listdir(data_dir) if f.endswith(".sst")])
     print(f"Dataset ready: {sst_count} SSTables generated on disk.\n")
@@ -53,62 +60,54 @@ def main() -> None:
     temp_dir = tempfile.mkdtemp(prefix="strata_bench_")
 
     try:
-        sst_count = setup_benchmark_db(temp_dir)
+        sst_count_before = setup_benchmark_db(temp_dir)
 
-        # 1. Prepare 5,000 PRESENT keys sampled randomly from existing keys
-        present_indices = rng.sample(range(NUM_TOTAL_KEYS), NUM_LOOKUPS)
+        # 1. Prepare 5,000 PRESENT keys sampled randomly from existing active keys
+        present_candidates = [i for i in range(NUM_TOTAL_KEYS) if not (2000 <= i < 2500)]
+        present_indices = rng.sample(present_candidates, NUM_LOOKUPS)
         present_keys = [f"user_{i:06d}" for i in present_indices]
 
-        # 2. Prepare 5,000 ABSENT keys interleaved within the key range so
-        # range checks [first_key, last_key] match, exercising the Bloom filter.
+        # 2. Prepare 5,000 ABSENT keys interleaved within key range
         absent_keys = [f"user_{i:06d}_missing" for i in range(NUM_LOOKUPS)]
 
-        # --- Benchmark 1: Absent Keys (Bloom OFF) ---
-        with Strata(temp_dir, sync=False, use_bloom=False) as db:
-            t_absent_off, stats_absent_off = run_lookups(db, absent_keys)
+        # --- Benchmark 1: Uncompacted (Bloom OFF) ---
+        with Strata(temp_dir, sync=False, use_bloom=False, auto_compact=False) as db:
+            t_absent_off, _ = run_lookups(db, absent_keys)
+            t_present_off, _ = run_lookups(db, present_keys)
 
-        # --- Benchmark 2: Absent Keys (Bloom ON) ---
-        with Strata(temp_dir, sync=False, use_bloom=True) as db:
+        # --- Benchmark 2: Uncompacted (Bloom ON) ---
+        with Strata(temp_dir, sync=False, use_bloom=True, auto_compact=False) as db:
             t_absent_on, stats_absent_on = run_lookups(db, absent_keys)
-
-        # --- Benchmark 3: Present Keys (Bloom OFF) ---
-        with Strata(temp_dir, sync=False, use_bloom=False) as db:
-            t_present_off, stats_present_off = run_lookups(db, present_keys)
-
-        # --- Benchmark 4: Present Keys (Bloom ON) ---
-        with Strata(temp_dir, sync=False, use_bloom=True) as db:
             t_present_on, stats_present_on = run_lookups(db, present_keys)
 
-        # Compute speedups
-        speedup_absent = t_absent_off / t_absent_on if t_absent_on > 0 else float("inf")
-        speedup_present = t_present_off / t_present_on if t_present_on > 0 else float("inf")
+        # --- Benchmark 3: Compaction ---
+        print("Compacting database...")
+        with Strata(temp_dir, sync=False, use_bloom=True, auto_compact=False) as db:
+            compaction_summary = db.compact()
+            sst_count_after = db.stats()["sstable_count"]
+            assert compaction_summary is not None
 
-        # Output Results
-        print("### Benchmark Results (5,000 lookups across 20,000 keys)")
-        print(f"Total SSTables: {sst_count}\n")
+            # --- Benchmark 4: Compacted (Bloom ON) ---
+            t_absent_compacted, stats_absent_compacted = run_lookups(db, absent_keys)
+            t_present_compacted, stats_present_compacted = run_lookups(db, present_keys)
 
-        header = (
-            "| Lookup Type | Bloom OFF | Bloom ON | Speedup | "
-            "Bloom Skips (ON) | Disk Lookups (ON) | False Positives (ON) |"
-        )
-        separator = (
-            "|:---|:---:|:---:|:---:|:---:|:---:|:---:|"
-        )
-        row_absent = (
-            f"| Absent Keys (5,000) | {t_absent_off:.4f} s | {t_absent_on:.4f} s | "
-            f"**{speedup_absent:.2f}x** | {stats_absent_on['bloom_skips']:,} | "
-            f"{stats_absent_on['disk_lookups']:,} | {stats_absent_on['false_positives']:,} |"
-        )
-        row_present = (
-            f"| Present Keys (5,000) | {t_present_off:.4f} s | {t_present_on:.4f} s | "
-            f"**{speedup_present:.2f}x** | {stats_present_on['bloom_skips']:,} | "
-            f"{stats_present_on['disk_lookups']:,} | {stats_present_on['false_positives']:,} |"
-        )
+        speedup_bloom_absent = t_absent_off / t_absent_on if t_absent_on > 0 else float("inf")
+        speedup_compact_present = t_present_on / t_present_compacted if t_present_compacted > 0 else float("inf")
+        speedup_compact_absent = t_absent_on / t_absent_compacted if t_absent_compacted > 0 else float("inf")
 
-        print(header)
-        print(separator)
-        print(row_absent)
-        print(row_present)
+        print("### Stage 4 Benchmark Results")
+        print(f"- **SSTables before compaction:** {sst_count_before}")
+        print(f"- **SSTables after compaction:** {sst_count_after}")
+        print(f"- **Compaction duration:** {compaction_summary['duration_ms']:.2f} ms")
+        print(f"- **Records in:** {compaction_summary['records_in']:,} | **Records out:** {compaction_summary['records_out']:,}")
+        print(f"- **Overwrites dropped:** {compaction_summary['overwritten_dropped']:,} | **Tombstones dropped:** {compaction_summary['tombstones_dropped']:,}\n")
+
+        print("#### Read Latency Comparison (5,000 lookups each)\n")
+        print("| Configuration | Absent Keys Time | Present Keys Time | Notes |")
+        print("|:---|:---:|:---:|:---|")
+        print(f"| **Uncompacted (Bloom OFF)** | {t_absent_off:.4f} s | {t_present_off:.4f} s | Searches across {sst_count_before} SSTables on disk |")
+        print(f"| **Uncompacted (Bloom ON)** | {t_absent_on:.4f} s | {t_present_on:.4f} s | {speedup_bloom_absent:.2f}x faster absent lookups |")
+        print(f"| **Compacted (Bloom ON)** | {t_absent_compacted:.4f} s | {t_present_compacted:.4f} s | **{speedup_compact_present:.2f}x** faster present lookups vs uncompacted |")
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
