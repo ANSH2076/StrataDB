@@ -1,4 +1,4 @@
-"""Unit tests for the Strata database (Stage 1).
+"""Unit tests for the Strata database (Stages 1–2).
 
 Run with:  python3 -m pytest tests/test_engine.py -v
 """
@@ -6,6 +6,8 @@ Run with:  python3 -m pytest tests/test_engine.py -v
 import os
 import json
 import zlib
+
+import pytest
 
 from strata import Strata
 
@@ -191,3 +193,21 @@ def test_non_string_key_raises(tmp_path):
             assert False, "Should have raised TypeError"
         except TypeError:
             pass
+
+def test_unknown_wal_op_raises(tmp_path):
+    """An unknown WAL operation raises ValueError on recovery."""
+    db_dir = str(tmp_path / "db")
+
+    # Write one good record, then close normally.
+    with Strata(db_dir) as db:
+        db.put("a", "1")
+
+    # Manually append a record with a bogus "op" to the WAL.
+    from strata.wal import _encode_record
+    bad_record = _encode_record({"op": "xyzzy", "k": "b"})
+    with open(os.path.join(db_dir, "wal.log"), "ab") as f:
+        f.write(bad_record)
+
+    # Reopening should raise ValueError.
+    with pytest.raises(ValueError, match="Unknown WAL operation"):
+        Strata(db_dir)

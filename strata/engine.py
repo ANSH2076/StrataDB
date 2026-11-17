@@ -53,8 +53,13 @@ class Strata:
                 self._mem.put(record["k"], record["v"])
             elif op == "del":
                 self._mem.delete(record["k"])
-            # Unknown ops are silently skipped.  This leaves room for
-            # future record types without breaking old recovery code.
+            else:
+                # An unknown op means the WAL is damaged or was written
+                # by a newer version we don't understand.  Fail loudly
+                # so the problem is noticed immediately.
+                raise ValueError(
+                    f"Unknown WAL operation: {op!r}"
+                )
 
     # -- Public API ------------------------------------------------------------
 
