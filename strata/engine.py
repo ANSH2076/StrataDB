@@ -32,6 +32,8 @@ class Strata:
         memtable_limit_bytes: In-memory byte threshold before the
                               memtable is automatically flushed to a
                               new SSTable on disk.
+        use_bloom: If True, uses in-memory Bloom filters to avoid disk
+                   reads for absent keys.
     """
 
     def __init__(
@@ -39,10 +41,17 @@ class Strata:
         data_dir: str,
         sync: bool = True,
         memtable_limit_bytes: int = DEFAULT_MEMTABLE_LIMIT_BYTES,
+        use_bloom: bool = True,
     ) -> None:
         self._data_dir = data_dir
         self._sync = sync
         self._memtable_limit_bytes = memtable_limit_bytes
+        self._use_bloom = use_bloom
+
+        # Counters for read performance and Stage 3/5 analytics
+        self._bloom_skips: int = 0
+        self._disk_lookups: int = 0
+        self._false_positives: int = 0
 
         os.makedirs(data_dir, exist_ok=True)
 
@@ -54,6 +63,7 @@ class Strata:
 
         # Recover on-disk SSTables and replay un-flushed WAL records.
         self._recover()
+
 
     # -- Recovery --------------------------------------------------------------
 
@@ -210,6 +220,13 @@ class Strata:
           1. In-memory MemTable (most recent mutations).
           2. SSTables from newest to oldest.
 
+        SSTable lookup steps:
+          a) Range check (first_key..last_key): cheap in-memory check, no disk.
+          b) Bloom check: if use_bloom and not table.might_contain(key),
+             increment bloom_skips and skip disk read entirely.
+          c) Real disk lookup: increment disk_lookups, call table.get(key).
+             If found=False, increment false_positives.
+
         Why tombstones must stop the search:
           If a key is found with value None (a tombstone), that means the
           key was explicitly deleted in that generation.  We MUST return
@@ -219,16 +236,32 @@ class Strata:
         """
         _validate_key(key)
 
-        # Check MemTable first.
+        # 1. Check MemTable first.
         found, value = self._mem.get(key)
         if found:
             return value
 
-        # Check SSTables newest to oldest.
+        # 2. Check SSTables newest to oldest.
         for sstable in self._sstables:
+            # a) Range check (first_key..last_key): cheap in-memory check, no disk.
+            if sstable.record_count == 0:
+                continue
+            if key < sstable.first_key or key > sstable.last_key:
+                continue
+
+            # b) Bloom filter check: skip disk lookup if key is absent.
+            if self._use_bloom and not sstable.might_contain(key):
+                self._bloom_skips += 1
+                continue
+
+            # c) Real disk lookup.
+            self._disk_lookups += 1
             found, value = sstable.get(key)
             if found:
                 return value
+            elif self._use_bloom:
+                # The filter said might_contain=True, but disk lookup was not found.
+                self._false_positives += 1
 
         # Not found anywhere.
         return None
@@ -239,6 +272,10 @@ class Strata:
             "memtable_keys": len(self._mem),
             "memtable_bytes": self._mem.size_bytes,
             "sstable_count": len(self._sstables),
+            "bloom_enabled": self._use_bloom,
+            "bloom_skips": self._bloom_skips,
+            "disk_lookups": self._disk_lookups,
+            "false_positives": self._false_positives,
             "sstables": [
                 {
                     "name": sst.name,
@@ -250,6 +287,7 @@ class Strata:
                 for sst in self._sstables
             ],
         }
+
 
     def close(self) -> None:
         """Close the database, flushing the WAL."""
