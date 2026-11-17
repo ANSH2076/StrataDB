@@ -167,10 +167,15 @@ bloom filters made lookups for missing keys about 4x faster, but made lookups
 for existing keys slightly slower, because the filter only saves work when
 the answer is "not here". The hardest part to get right was the order of
 operations during a flush: the WAL must only be reset after the SSTable is
-safely on disk, otherwise a crash at the wrong moment loses data. [One
-sentence about the bug, confusing moment or concept that was hardest for
-you.] I built this with AI assistance, and I reviewed, tested and can explain
-each component. Next I want to add compaction and the live dashboard so you
+safely on disk, otherwise a crash at the wrong moment loses data. 
+The hardest part for me was figuring out how not to lose data if the power
+cuts while an SSTable hasn't safely reached the disk yet. The answer was
+about order: the write-ahead log is only cleared *after* the new SSTable is
+fully written, `fsync`ed and atomically renamed, so at any moment either the
+log or the SSTable has the data. I built this with AI assistance, and I reviewed, tested and can explain
+each component.
+
+Next I want to add compaction and the live dashboard so you
 can watch the engine work.
 
 ## Learning notes
