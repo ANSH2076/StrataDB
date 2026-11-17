@@ -203,8 +203,8 @@ def test_unknown_wal_op_raises(tmp_path):
         db.put("a", "1")
 
     # Manually append a record with a bogus "op" to the WAL.
-    from strata.wal import _encode_record
-    bad_record = _encode_record({"op": "xyzzy", "k": "b"})
+    from strata.record import encode_record
+    bad_record = encode_record({"op": "xyzzy", "k": "b"})
     with open(os.path.join(db_dir, "wal.log"), "ab") as f:
         f.write(bad_record)
 

@@ -13,57 +13,11 @@ Example:
 
 from __future__ import annotations
 
-import json
 import os
-import zlib
-from typing import Dict, List, Optional
+from typing import Dict, List
 
+from strata.record import decode_record, encode_record
 
-# --- Record helpers -----------------------------------------------------------
-
-def _encode_record(record: Dict[str, str]) -> bytes:
-    """Turn a record dict into a WAL line: '<crc32> <json>\n' as bytes."""
-    payload = json.dumps(record, ensure_ascii=False)
-    payload_bytes = payload.encode("utf-8")
-    crc = zlib.crc32(payload_bytes) & 0xFFFFFFFF  # ensure unsigned 32-bit
-    line = f"{crc:08x} {payload}\n"
-    return line.encode("utf-8")
-
-
-def _decode_line(raw: bytes) -> Optional[Dict[str, str]]:
-    """Parse one WAL line.  Returns the record dict, or None if it is
-    corrupt (bad CRC, bad JSON, or wrong format)."""
-    # A valid line looks like: "a1b2c3d4 {....}\n"
-    text = raw.decode("utf-8", errors="replace")
-    text = text.rstrip("\n")
-
-    # Need at least "XXXXXXXX " (9 characters) before the JSON
-    if len(text) < 10 or text[8] != " ":
-        return None
-
-    crc_hex = text[:8]
-    payload = text[9:]
-
-    # Verify the CRC
-    try:
-        expected_crc = int(crc_hex, 16)
-    except ValueError:
-        return None
-
-    actual_crc = zlib.crc32(payload.encode("utf-8")) & 0xFFFFFFFF
-    if actual_crc != expected_crc:
-        return None
-
-    # Parse the JSON
-    try:
-        record = json.loads(payload)
-    except json.JSONDecodeError:
-        return None
-
-    return record
-
-
-# --- WriteAheadLog class ------------------------------------------------------
 
 class WriteAheadLog:
     """Append-only write-ahead log backed by a single file.
@@ -91,7 +45,7 @@ class WriteAheadLog:
         Without fsync, a power loss could lose data that flush() already
         handed to the OS but that the OS had not yet written to disk.
         """
-        data = _encode_record(record)
+        data = encode_record(record)
         self._file.write(data)
         self._file.flush()
         if self._sync:
@@ -132,7 +86,7 @@ class WriteAheadLog:
                 if not line.endswith(b"\n"):
                     break
 
-                record = _decode_line(line)
+                record = decode_record(line)
                 if record is None:
                     # CRC mismatch or bad JSON — stop here.
                     break
@@ -145,6 +99,25 @@ class WriteAheadLog:
             f.truncate(last_good_offset)
 
         return good_records
+
+    # -- Reset (used after flushing the memtable to an SSTable) ----------------
+
+    def reset(self) -> None:
+        """Truncate the WAL to empty and fsync.
+
+        Called after the memtable has been safely flushed to an SSTable.
+        At that point every record in the WAL is already persisted in
+        the SSTable, so we can discard them and start fresh.
+        """
+        self._file.close()
+        # Truncate to zero bytes.
+        with open(self._path, "r+b") as f:
+            f.truncate(0)
+            f.flush()
+            if self._sync:
+                os.fsync(f.fileno())
+        # Reopen for future appends.
+        self._file = open(self._path, "ab")
 
     # -- Lifecycle -------------------------------------------------------------
 
