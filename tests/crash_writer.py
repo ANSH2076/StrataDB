@@ -28,7 +28,14 @@ def main() -> None:
 
     # sync=True ensures every put is fsync'd before we print the index.
     # memtable_limit_bytes=2048 triggers frequent flushes to SSTables.
-    db = Strata(data_dir, sync=True, memtable_limit_bytes=2048)
+    # auto_compact=True with compaction_threshold=4 triggers background/inline compactions.
+    db = Strata(
+        data_dir,
+        sync=True,
+        memtable_limit_bytes=2048,
+        auto_compact=True,
+        compaction_threshold=4,
+    )
 
     i = 0
     while True:

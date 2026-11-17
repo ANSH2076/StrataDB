@@ -63,12 +63,18 @@ def run_one_round(round_num: int, base_dir: str) -> bool:
     proc.wait()
 
     # Count how many .sst files existed when the process was killed.
-    sst_count = len([f for f in os.listdir(data_dir) if f.endswith(".sst")])
+    sst_count_at_kill = len([f for f in os.listdir(data_dir) if f.endswith(".sst")])
 
     # Reopen and verify.
     start = time.time()
-    with Strata(data_dir) as db:
+    with Strata(data_dir, auto_compact=False) as db:
         recovery_ms = (time.time() - start) * 1000
+
+        # Check sst file count after reopening (orphans should have been cleaned up)
+        disk_ssts_after = sorted([f for f in os.listdir(data_dir) if f.endswith(".sst")])
+        from strata.manifest import read_manifest
+        manifest_ssts = sorted(read_manifest(data_dir) or [])
+        manifest_matches_disk = (disk_ssts_after == manifest_ssts)
 
         missing = []
         wrong = []
@@ -80,14 +86,16 @@ def run_one_round(round_num: int, base_dir: str) -> bool:
             elif val != expected:
                 wrong.append((idx, val, expected))
 
-    passed = len(missing) == 0 and len(wrong) == 0
+    passed = len(missing) == 0 and len(wrong) == 0 and manifest_matches_disk
 
     status = "PASS" if passed else "FAIL"
     print(f"  Round {round_num}: {status} — "
           f"{len(acked_indices)} acked writes, "
-          f"{sst_count} .sst files on disk, "
+          f"{sst_count_at_kill} .sst at kill -> {len(disk_ssts_after)} after reopen, "
           f"recovery took {recovery_ms:.1f} ms")
 
+    if not manifest_matches_disk:
+        print(f"    MANIFEST MISMATCH: disk={disk_ssts_after}, manifest={manifest_ssts}")
     if missing:
         print(f"    MISSING keys: {missing[:10]}{'...' if len(missing) > 10 else ''}")
     if wrong:
