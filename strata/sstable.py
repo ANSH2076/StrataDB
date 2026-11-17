@@ -19,6 +19,7 @@ import bisect
 import os
 from typing import Generator, List, Optional, Tuple
 
+from strata.bloom import BloomFilter
 from strata.record import decode_record, encode_record
 
 # We store a byte offset for every INDEX_INTERVAL-th record.  This
@@ -107,17 +108,24 @@ class SSTable:
         self._last_key: Optional[str] = None
         self._file_size: int = os.path.getsize(path)
 
+        self._bloom: BloomFilter = BloomFilter.for_capacity(0)
         self._build_index()
 
     # -- Index building --------------------------------------------------------
 
     def _build_index(self) -> None:
-        """Scan the file once to build the sparse index.
+        """Scan the file once to build the sparse index and Bloom filter.
 
         We record the key and byte offset of every INDEX_INTERVAL-th
         record.  This is O(n) in the number of records, but it only
         happens once when the SSTable is opened.
         """
+        # Count lines first so the Bloom filter is sized to match key count.
+        with open(self._path, "rb") as f:
+            total_lines = sum(1 for _ in f)
+
+        self._bloom = BloomFilter.for_capacity(total_lines)
+
         count = 0
         with open(self._path, "rb") as f:
             while True:
@@ -137,6 +145,15 @@ class SSTable:
 
                 key = record["k"]
 
+                # IMPORTANT: Add EVERY key to the filter, including tombstones
+                # (v = null).  Why?  If a deleted key is queried, we must find
+                # the tombstone in this SSTable so it can stop the search and
+                # prevent falling through to an older SSTable.  If tombstones
+                # were excluded, might_contain() would return False, the engine
+                # would skip this SSTable, and an older SSTable would resurrect
+                # the deleted key!
+                self._bloom.add(key)
+
                 if count == 0:
                     self._first_key = key
 
@@ -149,6 +166,11 @@ class SSTable:
                 count += 1
 
         self._record_count = count
+
+    def might_contain(self, key: str) -> bool:
+        """Test whether the key might exist in this SSTable using the Bloom filter."""
+        return self._bloom.might_contain(key)
+
 
     # -- Point lookup ----------------------------------------------------------
 
